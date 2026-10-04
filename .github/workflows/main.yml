@@ -6,7 +6,11 @@ on:
 
 jobs:
   terraform-ai-review:
-    runs-on: ubuntu-latest  
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      pull-requests: write
 
     steps:
       - name: Checkout the Code
@@ -19,33 +23,63 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: us-east-1
           
-      - name: Install Terrascan
-        run: |
-          curl -L https://github.com/tenable/terrascan/releases/download/v1.18.3/terrascan_1.18.3_Linux_x86_64.tar.gz \
-            | tar -xz
-          sudo mv terrascan /usr/local/bin/
-          terrascan version
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-      - name: Terrascan Init
-        run: terrascan init
-
-      - name: Run Terrascan (Terraform directory scan)
+      - name: Install Checkov
         run: |
-          set +e
-          terrascan scan \
-            -i terraform \
+          pip install --quiet checkov
+          checkov --version
+
+      - name: Run Checkov (Terraform directory scan)
+        run: |
+          checkov \
             -d terraform-review-agent/terraform \
-            -t aws \
+            --framework terraform \
             -o json \
-            --log-level error \
-            > terrascan_report.json
-          set -e
+            --quiet \
+            --compact \
+            --soft-fail \
+            > checkov_report.json
 
-      - name: Upload Terrascan Report
+      - name: Upload Checkov Report
         uses: actions/upload-artifact@v4
         with:
-          name: terrascan-report
-          path: terrascan_report.json  
+          name: checkov-report
+          path: checkov_report.json
+
+      # The Lambda expects {"results": {"violations": [...], "scan_summary": {...}}};
+      # map Checkov's failed checks into that shape.
+      - name: Build Lambda payload from Checkov report
+        run: |
+          jq '
+            (if type == "array" then . else [.] end)
+            | map(.results.failed_checks // []) | add // []
+            | map({
+                rule_id: .check_id,
+                rule_name: .check_name,
+                severity: ((.severity // "MEDIUM") | ascii_upcase),
+                description: .check_name,
+                resource_type: (.resource | split(".")[0]),
+                resource_name: .resource,
+                file: .file_path,
+                line: .file_line_range[0]
+              })
+            | {
+                results: {
+                  violations: .,
+                  scan_summary: {
+                    violated_policies: length,
+                    high: (map(select(.severity == "HIGH" or .severity == "CRITICAL")) | length),
+                    medium: (map(select(.severity == "MEDIUM")) | length),
+                    low: (map(select(.severity == "LOW" or .severity == "INFO")) | length)
+                  }
+                }
+              }
+          ' checkov_report.json > lambda_payload.json
+          jq '.results.scan_summary' lambda_payload.json
 
       - name: Invoke Terraform AI Review Lambda
         id: ai_review
@@ -53,9 +87,35 @@ jobs:
           aws lambda invoke \
             --function-name terraform-ai-review-agent \
             --cli-binary-format raw-in-base64-out \
-            --payload file://terrascan_report.json \
+            --payload file://lambda_payload.json \
             response.json
           jq -r '.ai_review' response.json
+
+      - name: Post AI Review as PR Comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+
+            let body;
+            try {
+              const response = JSON.parse(fs.readFileSync('response.json', 'utf8'));
+              const verdict = response.verdict || 'REJECT';
+              const review = response.ai_review || 'No review text was generated.';
+              const emoji = verdict === 'APPROVE' ? '✅'
+                          : verdict === 'APPROVE_WITH_CHANGES' ? '⚠️'
+                          : '❌';
+              body = `## 🤖 AI Terraform Review\n\n**Verdict:** ${emoji} \`${verdict}\`\n\n${review}\n\n---\n*Automated review — final decision remains with the human reviewer.*`;
+            } catch (e) {
+              body = `## 🤖 AI Terraform Review\n\n**Verdict:** ❌ \`REJECT\` (fail-safe)\n\nThe review pipeline could not produce a readable response: ${e.message}`;
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body
+            });
 
       - name: Fail PR if AI rejects
         run: |

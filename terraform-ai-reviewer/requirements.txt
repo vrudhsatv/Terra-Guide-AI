@@ -1,0 +1,4 @@
+# Runtime dependencies (terraform, tflint and checkov are installed by scripts/install_tools.sh)
+requests>=2.32,<3
+anthropic>=0.75
+openai>=1.60,<3

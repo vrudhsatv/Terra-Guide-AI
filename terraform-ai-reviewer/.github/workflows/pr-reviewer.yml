@@ -1,0 +1,146 @@
+# Terraform AI Reviewer: GitHub Actions workflow.
+#
+# Works two ways:
+#   1. Directly in this repository (pull_request trigger).
+#   2. As a reusable workflow from any Terraform repository:
+#
+#        jobs:
+#          terraform-review:
+#            uses: <org>/terraform-ai-reviewer/.github/workflows/pr-reviewer.yml@main
+#            with:
+#              reviewer_repository: <org>/terraform-ai-reviewer
+#              working_dirs: infra/prod,infra/staging   # optional, auto-detected otherwise
+#            secrets: inherit
+#
+# Advisory only: the job succeeds unless fail_on_severity is set.
+name: Terraform AI Reviewer
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths: ["**/*.tf", "**/*.tfvars"]
+  workflow_call:
+    inputs:
+      reviewer_repository:
+        description: "owner/repo hosting terraform-ai-reviewer (defaults to the calling repository)"
+        type: string
+        default: ""
+      reviewer_ref:
+        description: "Git ref of terraform-ai-reviewer to use"
+        type: string
+        default: "main"
+      working_dirs:
+        description: "Comma-separated Terraform directories (default: directories of changed .tf files)"
+        type: string
+        default: ""
+      rules_file:
+        description: "Policy file path, relative to the reviewed repo (default: bundled rules/org_policies.md)"
+        type: string
+        default: ""
+      report_scope:
+        description: "changed_lines | changed_files | all"
+        type: string
+        default: "changed_files"
+      fail_on_severity:
+        description: "Fail the job at this severity or above (CRITICAL/HIGH/MEDIUM/LOW); empty = advisory"
+        type: string
+        default: ""
+      llm_provider:
+        description: "anthropic | openai | gemini | none (default: first provider with an API key)"
+        type: string
+        default: ""
+      llm_model:
+        description: "Override the provider's default model"
+        type: string
+        default: ""
+      skip_tools:
+        description: "Comma-separated: init,validate,fmt,tflint,checkov,llm"
+        type: string
+        default: ""
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: false
+      OPENAI_API_KEY:
+        required: false
+      GEMINI_API_KEY:
+        required: false
+
+permissions:
+  contents: read
+  pull-requests: write # create/update the sticky review comment
+  checks: write        # publish the check run with line annotations
+
+concurrency:
+  group: terraform-ai-reviewer-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    name: Terraform AI Review
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.draft == false
+    timeout-minutes: 30
+    steps:
+      - name: Checkout pull request head
+        uses: actions/checkout@v4
+        with:
+          # Review the PR head, not the synthetic merge commit, so line numbers match the diff.
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Checkout reviewer
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.reviewer_repository || github.repository }}
+          ref: ${{ inputs.reviewer_repository && inputs.reviewer_ref || github.event.pull_request.head.sha }}
+          path: .terraform-ai-reviewer
+          fetch-depth: 1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build reviewer image
+        uses: docker/build-push-action@v6
+        with:
+          context: .terraform-ai-reviewer
+          tags: terraform-ai-reviewer:ci
+          load: true
+          cache-from: type=gha,scope=terraform-ai-reviewer
+          cache-to: type=gha,mode=max,scope=terraform-ai-reviewer
+
+      - name: Run review
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          TF_WORKING_DIRS: ${{ inputs.working_dirs }}
+          RULES_FILE_PATH: ${{ inputs.rules_file }}
+          REPORT_SCOPE: ${{ inputs.report_scope || 'changed_files' }}
+          FAIL_ON_SEVERITY: ${{ inputs.fail_on_severity }}
+          LLM_PROVIDER: ${{ inputs.llm_provider }}
+          LLM_MODEL: ${{ inputs.llm_model }}
+          SKIP_TOOLS: ${{ inputs.skip_tools }}
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/workspace" \
+            -v "$GITHUB_STEP_SUMMARY:/tmp/step-summary.md" \
+            -e GITHUB_STEP_SUMMARY=/tmp/step-summary.md \
+            -e GITHUB_ACTIONS -e GITHUB_REPOSITORY -e GITHUB_API_URL -e GITHUB_SERVER_URL \
+            -e GITHUB_TOKEN -e ANTHROPIC_API_KEY -e OPENAI_API_KEY -e GEMINI_API_KEY \
+            -e PR_NUMBER -e BASE_SHA -e HEAD_SHA -e BASE_REF \
+            -e TF_WORKING_DIRS -e RULES_FILE_PATH -e REPORT_SCOPE -e FAIL_ON_SEVERITY \
+            -e LLM_PROVIDER -e LLM_MODEL -e SKIP_TOOLS \
+            terraform-ai-reviewer:ci --output /workspace/.terraform-ai-reviewer/review-report.json
+
+      - name: Upload review report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-ai-review-report
+          path: .terraform-ai-reviewer/review-report.json
+          if-no-files-found: ignore

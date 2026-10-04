@@ -1,0 +1,71 @@
+# Terraform AI Reviewer: CircleCI pipeline.
+#
+# Setup:
+#   * Project Settings → Advanced → "Only build pull requests" = ON (so CIRCLE_PULL_REQUEST is set).
+#   * Create a context named "terraform-ai-reviewer" with GITHUB_TOKEN (repo scope, or a fine-grained
+#     token with Pull requests + Commit statuses write) and optionally ANTHROPIC_API_KEY /
+#     OPENAI_API_KEY / GEMINI_API_KEY.
+#   * In another Terraform repository, copy this file and set REVIEWER_REPO_URL to where the
+#     reviewer lives; inside the reviewer repository itself the local copy is used.
+#
+# Note: personal access tokens cannot create GitHub Check Runs, so on CircleCI the reviewer posts a
+# commit status plus the sticky PR comment instead.
+version: 2.1
+
+parameters:
+  reviewer_repo_url:
+    type: string
+    default: "https://github.com/your-org/terraform-ai-reviewer.git"
+  reviewer_ref:
+    type: string
+    default: "main"
+
+jobs:
+  terraform-ai-review:
+    docker:
+      - image: cimg/python:3.11
+    resource_class: medium
+    environment:
+      REPORT_SCOPE: changed_files
+      # TF_WORKING_DIRS: infra/prod,infra/staging
+      # FAIL_ON_SEVERITY: HIGH
+    steps:
+      - checkout
+      - run:
+          name: Locate reviewer
+          command: |
+            if [ -f src/main.py ] && [ -f rules/org_policies.md ]; then
+              echo "export REVIEWER_DIR=$PWD" >> "$BASH_ENV"
+            else
+              git clone --depth 1 --branch "<< pipeline.parameters.reviewer_ref >>" \
+                "<< pipeline.parameters.reviewer_repo_url >>" /tmp/terraform-ai-reviewer
+              echo "export REVIEWER_DIR=/tmp/terraform-ai-reviewer" >> "$BASH_ENV"
+            fi
+      - restore_cache:
+          keys:
+            - tf-ai-reviewer-v1-{{ arch }}
+      - run:
+          name: Install Terraform, TFLint, Checkov
+          command: sudo apt-get update -qq && sudo apt-get install -y -qq unzip && "$REVIEWER_DIR/scripts/install_tools.sh"
+      - run:
+          name: Install reviewer dependencies
+          command: |
+            python -m venv ~/reviewer-venv
+            ~/reviewer-venv/bin/pip install --quiet -r "$REVIEWER_DIR/requirements.txt"
+      - save_cache:
+          key: tf-ai-reviewer-v1-{{ arch }}
+          paths:
+            - ~/.cache/pip
+            - ~/.tflint.d
+      - run:
+          name: Run Terraform AI Review
+          command: ~/reviewer-venv/bin/python "$REVIEWER_DIR/src/main.py" --workspace "$PWD" --output /tmp/review-report.json
+      - store_artifacts:
+          path: /tmp/review-report.json
+          destination: review-report.json
+
+workflows:
+  pull-request-review:
+    jobs:
+      - terraform-ai-review:
+          context: terraform-ai-reviewer

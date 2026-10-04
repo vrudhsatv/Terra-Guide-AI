@@ -1,0 +1,79 @@
+# Terraform AI Reviewer: AWS CodeBuild / CodePipeline build specification.
+#
+# Recommended: a CodeBuild project with a GitHub source and webhook filter events
+# PULL_REQUEST_CREATED, PULL_REQUEST_UPDATED, PULL_REQUEST_REOPENED. CodeBuild then exposes the PR
+# number, base branch and head commit automatically.
+#
+# CodePipeline (V2 pipeline with a GitHub/CodeConnections source and a pull-request trigger):
+# add this as a CodeBuild action and pass, as environment-variable overrides,
+#   HEAD_SHA = #{SourceVariables.CommitId}
+#   GITHUB_REPOSITORY = #{SourceVariables.FullRepositoryName}
+#   BASE_REF = main            (your default branch)
+# The reviewer resolves the PR number from the commit through the GitHub API.
+#
+# Reviewer code location (first match wins):
+#   1. secondary source with identifier "reviewer"  -> $CODEBUILD_SRC_DIR_reviewer
+#   2. this repository is the reviewer itself       -> ./src/main.py exists
+#   3. git clone of $REVIEWER_REPO_URL at $REVIEWER_REF
+#
+# Secrets: one Secrets Manager secret ($REVIEWER_SECRET_ID, JSON) with any of the keys
+# GITHUB_TOKEN, ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY. Missing keys are fine
+# (no LLM key = deterministic checks only). The CodeBuild role needs secretsmanager:GetSecretValue.
+version: 0.2
+
+env:
+  shell: bash
+  variables:
+    REVIEWER_SECRET_ID: "terraform-ai-reviewer"
+    REVIEWER_REPO_URL: "https://github.com/your-org/terraform-ai-reviewer.git"
+    REVIEWER_REF: "main"
+    REPORT_SCOPE: "changed_files"
+    # TF_WORKING_DIRS: "infra/prod,infra/staging"
+    # FAIL_ON_SEVERITY: "HIGH"
+    # RULES_FILE_PATH: "policies/org_policies.md"
+  git-credential-helper: yes
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.11
+    commands:
+      - |
+        if [ -n "${CODEBUILD_SRC_DIR_reviewer:-}" ]; then
+          export REVIEWER_DIR="$CODEBUILD_SRC_DIR_reviewer"
+        elif [ -f "$CODEBUILD_SRC_DIR/src/main.py" ]; then
+          export REVIEWER_DIR="$CODEBUILD_SRC_DIR"
+        else
+          export REVIEWER_DIR="/tmp/terraform-ai-reviewer"
+          git clone --depth 1 --branch "$REVIEWER_REF" "$REVIEWER_REPO_URL" "$REVIEWER_DIR"
+        fi
+        echo "export REVIEWER_DIR=$REVIEWER_DIR" > /tmp/reviewer-env.sh
+      - . /tmp/reviewer-env.sh && "$REVIEWER_DIR/scripts/install_tools.sh"
+      - . /tmp/reviewer-env.sh && python -m venv /tmp/reviewer-venv && /tmp/reviewer-venv/bin/pip install --quiet -r "$REVIEWER_DIR/requirements.txt"
+
+  pre_build:
+    commands:
+      - |
+        SECRET_JSON=$(aws secretsmanager get-secret-value --secret-id "$REVIEWER_SECRET_ID" \
+          --query SecretString --output text 2>/dev/null || echo '{}')
+        python3 - "$SECRET_JSON" > /tmp/reviewer-secrets.sh <<'PY'
+        import json, shlex, sys
+        try:
+            data = json.loads(sys.argv[1])
+        except json.JSONDecodeError:
+            data = {}
+        for key in ("GITHUB_TOKEN", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY"):
+            if data.get(key):
+                print(f"export {key}={shlex.quote(data[key])}")
+        PY
+      - git config --global --add safe.directory '*'
+
+  build:
+    commands:
+      - . /tmp/reviewer-env.sh && . /tmp/reviewer-secrets.sh
+      - /tmp/reviewer-venv/bin/python "$REVIEWER_DIR/src/main.py" --workspace "$CODEBUILD_SRC_DIR" --output "$CODEBUILD_SRC_DIR/review-report.json"
+
+artifacts:
+  files:
+    - review-report.json
+  discard-paths: yes

@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>AI-Powered Terraform PR Reviewer — POC</title>
+<style>
+  body { font-family: Arial, sans-serif; font-size: 11pt; color: #202124; max-width: 8.5in; margin: 24px auto; line-height: 1.5; }
+  h1 { font-size: 20pt; color: #1a1a1a; border-bottom: 3px solid #1a73e8; padding-bottom: 6px; }
+  h2 { font-size: 15pt; color: #1a73e8; margin-top: 28px; }
+  h3 { font-size: 12pt; color: #202124; margin-top: 18px; }
+  table { border-collapse: collapse; width: 100%; margin: 10px 0 18px 0; }
+  th { background-color: #d9e5f5; border: 1px solid #9aa0a6; padding: 6px 10px; text-align: left; font-size: 10.5pt; }
+  td { border: 1px solid #9aa0a6; padding: 6px 10px; vertical-align: top; font-size: 10.5pt; }
+  code, .mono { font-family: 'Courier New', monospace; font-size: 10pt; }
+  .codeblock { font-family: 'Courier New', monospace; font-size: 9.5pt; background-color: #f1f3f4; border: 1px solid #dadce0; padding: 10px 14px; white-space: pre; margin: 10px 0 18px 0; }
+  .note { background-color: #fef7e0; border: 1px solid #f9cc79; padding: 8px 12px; margin: 10px 0 18px 0; }
+  li { margin-bottom: 3px; }
+</style>
+</head>
+<body>
+
+<h1>🤖 AI-Powered Terraform PR Reviewer — Proof of Concept</h1>
+<p><b>Approach:</b> Deterministic scan (Terrascan) + AI risk decision (Gemini) on serverless AWS, gating Terraform Pull Requests via GitHub Actions.</p>
+
+<h2>1. Core Technologies</h2>
+<table>
+  <tr><th>Technology</th><th>Role in the POC</th></tr>
+  <tr><td>GitHub Actions</td><td>Pipeline entry point; triggers on Terraform PR changes</td></tr>
+  <tr><td>GitHub Pull Request</td><td>Unit of review; receives the check result and review comment</td></tr>
+  <tr><td>Terraform</td><td>Infrastructure-as-Code under review</td></tr>
+  <tr><td>Terrascan</td><td>Deterministic IaC security and policy scanning (AWS policy set)</td></tr>
+  <tr><td>AWS Lambda</td><td>Serverless AI review agent</td></tr>
+  <tr><td>AWS Secrets Manager</td><td>Stores the Gemini API key outside code and CI</td></tr>
+  <tr><td>AI Reviewer (Gemini)</td><td>Applies the risk-based decision policy to scan findings</td></tr>
+  <tr><td>CI Merge Gate</td><td>Fails the PR check when the verdict is REJECT</td></tr>
+</table>
+
+<h2>2. Core Principle</h2>
+<p>A deterministic scanner identifies objective security issues, the AI applies a strict risk-based decision policy on top of those findings, and the CI pipeline enforces the resulting verdict as a merge gate.</p>
+<p>The system does not deploy infrastructure from the review pipeline and does not merge Pull Requests. It fails the PR check when the AI verdict is <b>REJECT</b>; the human reviewer retains the ability to inspect, override, and make the final merge decision.</p>
+<div class="note"><b>Fail-closed by design:</b> if the AI response is unclear or any error occurs anywhere in the pipeline, the verdict defaults to <b>REJECT</b>. A silent approval is never possible.</div>
+
+<h2>3. Problem Statement</h2>
+<p>Terraform Pull Requests require reviewers to check multiple areas at the same time:</p>
+<table>
+  <tr><th>Review Area</th><th>Questions the reviewer must answer</th></tr>
+  <tr><td><b>Security</b></td><td>Is a security group publicly accessible? Are IAM permissions too broad? Is encryption enabled? Is an S3 bucket publicly accessible? Is the load balancer serving traffic without HTTPS?</td></tr>
+  <tr><td><b>Risk Level</b></td><td>How severe are the issues, taken together? Is the change safe to ship now, safe with follow-up fixes, or unsafe?</td></tr>
+  <tr><td><b>Consistency</b></td><td>Different reviewers apply different thresholds; manual severity judgment is slow and inconsistent across PRs.</td></tr>
+</table>
+<p>The goal of this POC is to demonstrate that a scanner + AI combination can apply a <b>consistent, policy-driven risk decision</b> to every Terraform PR automatically.</p>
+
+<h2>4. Solution Overview</h2>
+<p>The POC follows a <b>deterministic scan + AI decision</b> architecture, deployed on serverless AWS.</p>
+
+<h3>4.1 High-Level Flow</h3>
+<table>
+  <tr><th>#</th><th>Stage</th><th>What happens</th></tr>
+  <tr><td>1</td><td>Terraform PR</td><td>Developer creates or updates a PR touching Terraform code</td></tr>
+  <tr><td>2</td><td>GitHub Actions</td><td>Workflow triggers automatically on the PR event</td></tr>
+  <tr><td>3</td><td>Terrascan Scan</td><td>Deterministic pass — IaC security scan, JSON report</td></tr>
+  <tr><td>4</td><td>Findings Extractor</td><td>Normalizes scan output into a structured findings set</td></tr>
+  <tr><td>5</td><td>Prompt Builder</td><td>Combines findings with the strict decision policy</td></tr>
+  <tr><td>6</td><td>AI Reviewer (Gemini)</td><td>Analyzes findings and produces a policy-bound review</td></tr>
+  <tr><td>7</td><td>Verdict Extractor</td><td>Parses APPROVE / APPROVE_WITH_CHANGES / REJECT (fail-safe REJECT)</td></tr>
+  <tr><td>8</td><td>GitHub PR Comment</td><td>Verdict + full AI review posted on the PR conversation</td></tr>
+  <tr><td>9</td><td>CI Merge Gate</td><td>PR check fails on REJECT</td></tr>
+  <tr><td>10</td><td>Human Reviewer</td><td>Makes the final merge decision</td></tr>
+</table>
+
+<h3>4.2 Detailed Implementation Flow</h3>
+<p>End to end, from PR creation to the merge-protecting GitHub check:</p>
+<table>
+  <tr><th>Step</th><th>Component</th><th>Actions</th></tr>
+  <tr><td>1</td><td>Developer</td><td>Creates / updates a PR with changes under <code>terraform-review-agent/**</code></td></tr>
+  <tr><td>2</td><td>GitHub Actions<br><code>.github/workflows/main.yml</code></td><td>Checkout repository · Configure AWS credentials (repo secrets) · Install Terrascan v1.18.3 · <code>terrascan init</code></td></tr>
+  <tr><td>3</td><td>Terrascan Scan</td><td>Scans <code>terraform-review-agent/terraform</code> with the AWS policy set, JSON output; report uploaded as a workflow artifact</td></tr>
+  <tr><td>4</td><td>AWS Lambda<br><code>terraform-ai-review-agent</code></td><td>Invoked with <code>terrascan_report.json</code> as payload</td></tr>
+  <tr><td>5</td><td>Findings Extractor (in Lambda)</td><td>Builds severity summary + structured violations from the raw report</td></tr>
+  <tr><td>6</td><td>Secrets Manager</td><td>Provides the Gemini API key; cached per Lambda container</td></tr>
+  <tr><td>7</td><td>Prompt Builder (in Lambda)</td><td>Embeds decision policy, output format, and findings JSON</td></tr>
+  <tr><td>8</td><td>Gemini API<br><code>gemini-2.5-flash</code></td><td>Returns: issues by severity, required remediation, risk justification, final verdict</td></tr>
+  <tr><td>9</td><td>Verdict Extractor (in Lambda)</td><td>Parses "Final verdict"; defaults to REJECT if unclear (fail-safe)</td></tr>
+  <tr><td>10</td><td>Lambda Response</td><td><code>{ verdict, summary, ai_review }</code></td></tr>
+  <tr><td>11</td><td>GitHub Actions</td><td>Prints AI review in workflow log · Posts AI review as a PR comment · <code>exit 1</code> if verdict == REJECT</td></tr>
+  <tr><td>12</td><td>GitHub PR</td><td>Receives the review comment and the Passed / Failed check; merge protection to configure</td></tr>
+  <tr><td>13</td><td>Human Reviewer</td><td>Final decision</td></tr>
+</table>
+
+<h2>5. Architecture Philosophy</h2>
+<p>The architecture intentionally keeps responsibilities separate:</p>
+<table>
+  <tr><th>Component</th><th>Responsibility</th></tr>
+  <tr><td>GitHub Actions</td><td>Start the review automatically for PRs touching Terraform code.</td></tr>
+  <tr><td>Terrascan</td><td>Perform deterministic IaC security scanning against AWS policies.</td></tr>
+  <tr><td>Findings Extractor</td><td>Normalize raw Terrascan output into a structured findings set.</td></tr>
+  <tr><td>Prompt Builder</td><td>Combine findings with the strict risk-based decision policy.</td></tr>
+  <tr><td>AI Reviewer (Gemini)</td><td>Analyze findings, explain risk, and produce a policy-bound verdict.</td></tr>
+  <tr><td>Verdict Extractor</td><td>Parse the verdict deterministically; default to REJECT when unclear.</td></tr>
+  <tr><td>Secrets Manager</td><td>Store the Gemini API key outside code and CI logs.</td></tr>
+  <tr><td>PR Comment Publisher</td><td>Post the verdict and full AI review as a comment on the PR conversation.</td></tr>
+  <tr><td>CI Merge Gate</td><td>Fail the PR check on REJECT so merge protection can block the PR.</td></tr>
+</table>
+<p>The final decision remains with the <b>human reviewer</b>: the pipeline publishes a pass/fail check and a readable AI review, and branch protection (to configure) determines whether a failed check blocks merging.</p>
+
+<h2>6. GitHub Actions</h2>
+<p>GitHub Actions is the entry point of the pipeline. A developer creates or updates a PR, GitHub raises the event, and the <code>Terraform-AI-Review-Agent</code> workflow runs.</p>
+
+<h3>6.1 Trigger Events</h3>
+<ul>
+  <li><code>pull_request</code> events on changes under <code>terraform-review-agent/**</code></li>
+</ul>
+
+<h3>6.2 Workflow Steps (reviewer workflow — <code>.github/workflows/main.yml</code>)</h3>
+<ol>
+  <li>Checkout repository</li>
+  <li>Configure AWS credentials (from repository secrets)</li>
+  <li>Install Terrascan v1.18.3</li>
+  <li><code>terrascan init</code></li>
+  <li>Run Terrascan against <code>terraform-review-agent/terraform</code> (AWS policies, JSON output)</li>
+  <li>Upload the Terrascan report as a workflow artifact</li>
+  <li>Invoke the <code>terraform-ai-review-agent</code> Lambda with the report as payload</li>
+  <li>Post the verdict and full AI review as a comment on the PR</li>
+  <li>Print the AI review and fail the job if the verdict is REJECT</li>
+</ol>
+
+<h3>6.3 Output</h3>
+<p>A pass/fail GitHub check on the PR, an AI review comment posted directly on the PR conversation, the full AI review text in the workflow log, and the raw Terrascan report as a downloadable artifact.</p>
+
+<h2>7. Terrascan (Deterministic Pass)</h2>
+<p>Terrascan performs Infrastructure-as-Code security and policy scanning before any AI is involved. Typical areas covered:</p>
+<ul>
+  <li>Security groups and public exposure</li>
+  <li>IAM</li>
+  <li>S3</li>
+  <li>Encryption</li>
+  <li>Logging</li>
+  <li>Network security</li>
+  <li>Load balancer configuration</li>
+</ul>
+<p>The scan itself does not stop the pipeline — the findings are the input to the AI decision, not an immediate failure. Output: <code>terrascan_report.json</code> containing a scan summary (counts by severity) and per-violation details (rule, severity, description, resource, file, line).</p>
+
+<h2>8. Findings Extractor</h2>
+<p>Inside the Lambda, the raw Terrascan report is reduced to the fields the AI actually needs:</p>
+<table>
+  <tr><th>Section</th><th>Fields</th></tr>
+  <tr><td><b>summary</b></td><td>total_violations · high / medium / low counts</td></tr>
+  <tr><td><b>violations[ ]</b></td><td>rule_id · rule_name · severity · description · resource_type · resource_name · file · line</td></tr>
+</table>
+<p>This keeps the prompt compact, removes scanner noise (scan errors are ignored), and gives the AI a consistent input shape regardless of how verbose the raw report is.</p>
+
+<h2>9. Prompt Builder and Decision Policy</h2>
+<p>The Prompt Builder assembles a structured prompt that positions the AI as a senior DevOps / Terraform security reviewer acting as a CI/CD security gate, and embeds a <b>strict decision policy</b> the verdict must follow.</p>
+
+<h3>9.1 Decision Policy</h3>
+<table>
+  <tr><th>Verdict</th><th>Condition</th></tr>
+  <tr><td>❌ <b>REJECT</b></td><td>Any HIGH or CRITICAL severity issue exists · OR MEDIUM severity issues ≥ 4 · OR the Application Load Balancer has no HTTPS listener at all</td></tr>
+  <tr><td>⚠️ <b>APPROVE_WITH_CHANGES</b></td><td>MEDIUM severity issues are 1–3</td></tr>
+  <tr><td>✅ <b>APPROVE</b></td><td>Only LOW or INFO issues exist</td></tr>
+</table>
+<p>This encodes <b>"security without blocking velocity"</b>: hard failures for real risk, conditional approval for fixable issues, clean approval for noise-level findings.</p>
+
+<h3>9.2 Required Output Format</h3>
+<ol>
+  <li>Security issues ordered by severity (summary only)</li>
+  <li>Required remediation (actionable items only)</li>
+  <li>Risk justification (1–2 lines)</li>
+  <li>Final verdict: <code>APPROVE | APPROVE_WITH_CHANGES | REJECT</code></li>
+</ol>
+
+<h2>10. AI Reviewer (Gemini)</h2>
+<table>
+  <tr><th>AI Tool</th><th>Model</th><th>Role</th><th>Status</th></tr>
+  <tr><td>Gemini</td><td>gemini-2.5-flash</td><td>Reviews findings and issues the policy-bound verdict</td><td>Active (only provider in POC)</td></tr>
+</table>
+<ul>
+  <li>The Lambda calls the Gemini REST API directly (no SDK dependency).</li>
+  <li>The API key is fetched from <b>AWS Secrets Manager</b> at runtime and cached for the lifetime of the Lambda container — it never appears in code, CI configuration, or logs.</li>
+  <li>The call runs with a 30-second timeout; API errors surface as a failed review rather than a crash.</li>
+</ul>
+
+<h2>11. Verdict Extractor (Fail-Safe)</h2>
+<p>The AI's free-text response is converted into a machine-readable decision:</p>
+<ul>
+  <li>The extractor looks for the <b>"Final verdict"</b> marker in the response.</li>
+  <li>It matches <code>REJECT</code>, then <code>APPROVE_WITH_CHANGES</code>, then <code>APPROVE</code> — in that order, so the most restrictive verdict wins on ambiguity.</li>
+  <li>If no verdict can be identified, or any exception occurs anywhere in the Lambda, the result is <b>REJECT</b>.</li>
+</ul>
+<table>
+  <tr><th>Situation</th><th>Result</th></tr>
+  <tr><td>Clear verdict in the AI response</td><td>Use it</td></tr>
+  <tr><td>Unclear response / any error</td><td>REJECT (fail closed)</td></tr>
+</table>
+<p><b>A silent approval is structurally impossible.</b></p>
+
+<h2>12. GitHub PR Comment</h2>
+<p>After the Lambda responds, the workflow posts the review directly on the Pull Request conversation using <code>actions/github-script</code>, so the developer sees the outcome without opening the workflow logs.</p>
+
+<h3>12.1 Comment Content</h3>
+<ul>
+  <li>Verdict badge: ✅ <code>APPROVE</code> / ⚠️ <code>APPROVE_WITH_CHANGES</code> / ❌ <code>REJECT</code></li>
+  <li>The full AI review (issues by severity, required remediation, risk justification, final verdict)</li>
+  <li>A note that the final decision remains with the human reviewer</li>
+</ul>
+
+<h3>12.2 Example</h3>
+<div class="codeblock">🤖 AI Terraform Review
+
+Verdict: ❌ REJECT
+
+🚨 Security issues
+- HIGH: Security group allows unrestricted ingress (0.0.0.0/0)
+
+🛠 Required remediation
+- Restrict inbound access to required ports and trusted source ranges
+
+⚖️ Risk justification
+Publicly exposed workload across all ports.
+
+📌 Final verdict: REJECT
+
+---
+Automated review — final decision remains with the human reviewer.</div>
+
+<h3>12.3 Fail-Safe Behavior</h3>
+<ul>
+  <li>If the Lambda response cannot be parsed, the comment still posts with a ❌ <code>REJECT (fail-safe)</code> verdict and the parse error, so the PR always receives visible feedback.</li>
+  <li>The comment is posted <b>before</b> the merge-gate step runs, so a REJECT verdict never prevents the review from reaching the PR.</li>
+  <li>The workflow grants its <code>GITHUB_TOKEN</code> the <code>pull-requests: write</code> permission (scoped to this job) to allow comment creation.</li>
+</ul>
+
+<h2>13. CI Merge Gate</h2>
+<p>The final workflow step reads the verdict from the Lambda response:</p>
+<table>
+  <tr><th>Verdict</th><th>Workflow result</th><th>GitHub check</th></tr>
+  <tr><td>❌ REJECT</td><td>Job fails (<code>exit 1</code>)</td><td>Failed</td></tr>
+  <tr><td>✅ APPROVE / ⚠️ APPROVE_WITH_CHANGES</td><td>Job passes</td><td>Passed</td></tr>
+</table>
+<p>Branch protection can be configured to require this check before a PR is merged (to configure). Until then, the failed check is a strong visible signal to the human reviewer.</p>
+
+<h2>14. Supporting Serverless Infrastructure</h2>
+<p>The review agent itself runs serverless, and the repository includes a realistic AWS workload (under <code>terraform/</code>) that serves as the infrastructure being reviewed:</p>
+<table>
+  <tr><th>AWS Service</th><th>Purpose</th></tr>
+  <tr><td>AWS Lambda</td><td>The AI review agent</td></tr>
+  <tr><td>Amazon ECS (Fargate)</td><td>Demo application runtime</td></tr>
+  <tr><td>Application Load Balancer + ACM</td><td>Traffic routing and HTTPS enforcement (the decision policy explicitly checks for the HTTPS listener)</td></tr>
+  <tr><td>VPC / Security Groups / IAM</td><td>Network and permission surface that Terrascan evaluates</td></tr>
+  <tr><td>Secrets Manager</td><td>Gemini API key</td></tr>
+  <tr><td>S3 backend</td><td>Terraform state</td></tr>
+</table>
+<p>This gives the POC real, non-trivial Terraform to review rather than toy examples.</p>
+
+<h2>15. Example End-to-End Scenario</h2>
+
+<h3>15.1 PR Change</h3>
+<div class="codeblock">resource "aws_security_group" "app" {
+  ingress {
+    from_port   = 0
+    to_port     = 65535
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}</div>
+
+<h3>15.2 Step-by-Step Walkthrough</h3>
+<table>
+  <tr><th>Step</th><th>Component</th><th>What happens</th></tr>
+  <tr><td>1</td><td>GitHub Actions Trigger</td><td>A <code>pull_request</code> event on <code>terraform-review-agent/**</code> triggers the workflow automatically.</td></tr>
+  <tr><td>2</td><td>Terrascan</td><td>Finds <b>HIGH — Security group allows unrestricted ingress (0.0.0.0/0)</b>. Report saved and uploaded as an artifact.</td></tr>
+  <tr><td>3</td><td>Findings Extractor</td><td>summary: { high: 1, medium: 0, low: 0 }; violation mapped to <code>aws_security_group</code> / <code>security.tf:42</code></td></tr>
+  <tr><td>4</td><td>Prompt Builder</td><td>Findings embedded into the prompt together with the strict decision policy and required output format.</td></tr>
+  <tr><td>5</td><td>AI Reviewer (Gemini)</td><td>Summarizes the issue, lists remediation (restrict ports and source ranges), justifies the risk — and because a HIGH issue exists, the policy forces: <b>📌 Final verdict: REJECT</b></td></tr>
+  <tr><td>6</td><td>Verdict Extractor</td><td><code>REJECT</code> parsed from the response.</td></tr>
+  <tr><td>7</td><td>GitHub PR Comment</td><td>Verdict badge and the full AI review posted on the PR conversation.</td></tr>
+  <tr><td>8</td><td>CI Merge Gate</td><td>Workflow exits with code 1; the GitHub check on the PR is <b>Failed</b>.</td></tr>
+  <tr><td>9</td><td>Human Review</td><td>The reviewer reads the AI review, requests the fix; the developer pushes a corrected commit, which re-triggers the pipeline automatically.</td></tr>
+</table>
+
+<h2>16. Reviewer Includes</h2>
+<ul>
+  <li>GitHub Actions trigger on Terraform PR changes</li>
+  <li>Path-scoped triggering (<code>terraform-review-agent/**</code>)</li>
+  <li>Deterministic Terrascan security scan (AWS policy set)</li>
+  <li>Scan report published as a workflow artifact</li>
+  <li>Findings normalization (severity summary + structured violations)</li>
+  <li>Prompt Builder embedding a strict risk-based decision policy</li>
+  <li>HTTPS enforcement check for the ALB</li>
+  <li>AI review via Gemini (serverless Lambda, direct REST call)</li>
+  <li>API key isolation via AWS Secrets Manager with container-level caching</li>
+  <li>Deterministic verdict extraction with fail-closed REJECT default</li>
+  <li>Fail-closed error handling across the Lambda (errors can never approve)</li>
+  <li>AI review posted as a GitHub PR comment (verdict badge + full review)</li>
+  <li>CI merge gate failing the PR check on REJECT, with merge protection to configure</li>
+  <li>Human-controlled final decision</li>
+</ul>
+
+<h2>17. Known Limitations and Next Steps</h2>
+<p>This POC intentionally keeps the pipeline small. The following evolutions map it toward the full target design:</p>
+<table>
+  <tr><th>Area</th><th>POC today</th><th>Next step</th></tr>
+  <tr><td>Deterministic checks</td><td>Terrascan only</td><td>Add <code>terraform fmt</code> / <code>validate</code>, TFLint, Checkov; reuse existing check results</td></tr>
+  <tr><td>Org standards</td><td>Encoded in the AI prompt (HTTPS rule)</td><td>Dedicated custom org rules (tags, naming, allowed configurations)</td></tr>
+  <tr><td>AI provider</td><td>Gemini only</td><td>LLM Factory with Claude primary and Gemini / OpenAI fallback</td></tr>
+  <tr><td>Sanitization</td><td>Not required (scanner findings only reach the AI, not raw diffs)</td><td>Sensitive-value detection and redaction before any diff is sent to an LLM</td></tr>
+  <tr><td>Findings handling</td><td>AI consolidates in one pass</td><td>Finding Engine: normalize, correlate, deduplicate, validate across sources</td></tr>
+  <tr><td>PR feedback</td><td>PR summary comment + workflow log + artifact</td><td>Inline comments on the exact changed lines</td></tr>
+  <tr><td>Scope of analysis</td><td>Full directory scan</td><td>Diff-aware Change Analyzer scoped to changed resources</td></tr>
+  <tr><td>Merge control</td><td>Check fails on REJECT; protection to configure</td><td>Branch protection requiring the check, with documented override path</td></tr>
+</table>
+
+</body>
+</html>

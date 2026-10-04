@@ -14,7 +14,7 @@ pipeline {
                     FAILED_STAGE = env.STAGE_NAME
                 }
                 git branch: 'main',
-                    url: "https://github.com/Pravesh-Sudha/ai-devops-agent.git"
+                    url: "https://github.com/vrudhsatv/Terra-Guide-AI.git"
             }
         }
 
@@ -39,7 +39,7 @@ pipeline {
                 }
                 sh '''
                   docker run --name cicd-copilot \
-                    -d -p 3000:3000 cicd-copilot:v2 > ${LOG_FILE} 2>&1
+                    -d -p 3000:3000 cicd-copilot:v1 > ${LOG_FILE} 2>&1
                 '''
                 echo 'Your application is running on port 3000 🚀'
             }
