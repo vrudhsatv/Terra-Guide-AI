@@ -4,3 +4,15 @@ cicd-copilot/.next
 cicd-copilot/node_modules
 cicd-copilot/docker_build.log
 cicd-copilot/terra-config/.terraform*
+
+.venv/
+__pycache__/
+*.pyc
+
+.venv/
+__pycache__/
+*.pyc
+
+.venv/
+__pycache__/
+*.pyc
